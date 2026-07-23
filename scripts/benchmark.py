@@ -50,7 +50,7 @@ def main() -> None:
         for prompt in prompts:
             result = pipeline.run(prompt)
             totals.append(result.timings["total_ms"])
-            success += int(result["status"] == "success")
+            success += int(result.status == "success")
             count += 1
 
     summary = {
