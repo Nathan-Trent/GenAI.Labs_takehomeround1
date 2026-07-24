@@ -1,5 +1,11 @@
 # Senior Full Stack Engineer (GenAI-Labs) Take-Home Assignment
 
+> **Solution submitted — see [`SOLUTION_NOTES.md`](SOLUTION_NOTES.md) for what
+> changed and why, [`CHECKLIST.md`](CHECKLIST.md) for the production-readiness
+> checklist, and [`docs/FINDINGS.md`](docs/FINDINGS.md) for the baseline
+> investigation log. Solution-specific setup notes are in
+> [Running the solution](#running-the-solution) below.
+
 ## Timebox
 Plan for **4-6 hours**.
 
@@ -96,6 +102,45 @@ set OPENROUTER_API_KEY=<your_key>
 
 On Linux/macOS: `export OPENROUTER_API_KEY=<your_key>`
 
+## Running the solution
+
+Additions on top of the baseline setup instructions:
+
+### API key via .env
+
+`.env` is now actually loaded (the baseline shipped `python-dotenv` but never
+called it). Copy `.env.example` to `.env` and set your key — no manual
+`export`/`set` needed:
+
+```
+OPENROUTER_API_KEY=sk-or-v1-...
+```
+
+Optional environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENROUTER_MODEL` | `openai/gpt-5-nano` | Override the LLM |
+| `LOG_LEVEL` | `INFO` | Structured log verbosity |
+| `LOG_DISABLED` | unset | Set to `1` to silence logs (used for clean benchmark output) |
+
+### Tests
+
+```bash
+# Unit tests — no API key or dataset download required (23 tests)
+python -m unittest tests.test_validation tests.test_caching
+
+# Public integration tests — require OPENROUTER_API_KEY and the dataset (5 tests)
+python -m unittest discover -s tests -p "test_public.py"
+```
+
+### Logs
+
+The pipeline emits one JSON object per line to stderr; every stage and LLM
+call carries a `request_id`, so a single request's full lifecycle (timings,
+tokens, dollar cost, validation verdicts, cache hits) can be traced with one
+grep.
+
 ## Benchmark
 Run:
 
@@ -103,9 +148,16 @@ Run:
 python3 scripts/benchmark.py --runs 3
 ```
 
-This prints baseline-style latency stats (`avg`, `p50`, `p95`) and success rate.
+This prints latency stats (`avg`, `p50`, `p95`), success rate, and — added in
+this solution — average tokens per request, average LLM calls per request, and
+total dollar cost. Use `LOG_DISABLED=1` for clean JSON-only output. Note that
+repeated `--runs` exercise the response cache (warm numbers); a single run
+shows cold performance.
 
-**Reference metrics** (baseline on reference hardware): avg ~2900ms, p50 ~2500ms, p95 ~4700ms, ~600 tokens/request. 
+**Reference metrics** (baseline on reference hardware): avg ~2900ms, p50 ~2500ms, p95 ~4700ms, ~600 tokens/request.
+**Measured** (this solution, see `CHECKLIST.md`): baseline as shipped was 0%
+success at ~5700ms avg; the solution achieves 100% success at ~3900ms cold /
+~2000ms warm.
 
 ## Deliverables
 1. Updated source code
