@@ -3,12 +3,15 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from src.llm_client import OpenRouterLLMClient, build_default_llm_client
 from src.observability import log_event, new_request_id
 from src.schema import TABLE_NAME, build_schema_context
 from src.types import (
+    AnswerGenerationOutput,
+    SQLGenerationOutput,
     SQLValidationOutput,
     SQLExecutionOutput,
     PipelineOutput,
@@ -20,6 +23,30 @@ DEFAULT_DB_PATH = BASE_DIR / "data" / "gaming_mental_health.sqlite"
 
 MAX_RESULT_ROWS = 100
 QUERY_TIMEOUT_S = 10.0
+
+# The dataset is static and the DB is opened read-only, so cached SQL and
+# cached answers can never go stale. Two layers:
+#   question -> SQL   (exact repeat questions skip LLM call #1)
+#   SQL -> answer     (paraphrases that converge to the same SQL skip call #2)
+CACHE_MAX_ENTRIES = 256
+
+
+class _LRUCache:
+    def __init__(self, max_entries: int = CACHE_MAX_ENTRIES) -> None:
+        self._data: OrderedDict[str, str] = OrderedDict()
+        self._max = max_entries
+
+    def get(self, key: str) -> str | None:
+        if key in self._data:
+            self._data.move_to_end(key)
+            return self._data[key]
+        return None
+
+    def put(self, key: str, value: str) -> None:
+        self._data[key] = value
+        self._data.move_to_end(key)
+        while len(self._data) > self._max:
+            self._data.popitem(last=False)
 
 
 class SQLValidationError(Exception):
@@ -172,6 +199,8 @@ class AnalyticsPipeline:
         self.validator = SQLValidator(self.db_path)
         self.executor = SQLiteExecutor(self.db_path)
         self._schema_context = build_schema_context(self.db_path)
+        self._sql_cache = _LRUCache()
+        self._answer_cache = _LRUCache()
 
     @staticmethod
     def _merge_generation_outputs(first, repair):
@@ -193,10 +222,28 @@ class AnalyticsPipeline:
         request_id = request_id or new_request_id()
         log_event("pipeline.request.start", request_id=request_id, question=question[:300])
 
-        # Stage 1: SQL Generation (schema-aware)
-        sql_gen_output = self.llm.generate_sql(
-            question, {"schema": self._schema_context}, request_id=request_id
-        )
+        # Stage 1: SQL Generation (schema-aware), with question->SQL cache
+        norm_question = " ".join(question.lower().split())
+        cached_sql = self._sql_cache.get(norm_question)
+        if cached_sql is not None:
+            log_event("cache.sql.hit", request_id=request_id)
+            sql_gen_output = SQLGenerationOutput(
+                sql=cached_sql,
+                timing_ms=0.0,
+                llm_stats={
+                    "llm_calls": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "model": self.llm.model,
+                },
+                intermediate_outputs=[{"cache_hit": True}],
+                error=None,
+            )
+        else:
+            sql_gen_output = self.llm.generate_sql(
+                question, {"schema": self._schema_context}, request_id=request_id
+            )
         generated_sql = sql_gen_output.sql
         log_event(
             "stage.sql_generation",
@@ -259,19 +306,42 @@ class AnalyticsPipeline:
             error=execution_output.error,
         )
 
-        # Stage 4: Answer Generation (honest about upstream failures)
-        answer_output = self.llm.generate_answer(
-            question,
-            sql,
-            rows,
-            execution_error=execution_output.error,
-            no_sql_reason=(
-                refusal_reason
-                if generated_sql is None
-                else (validation_output.error if not validation_output.is_valid else None)
-            ),
-            request_id=request_id,
+        # Stage 4: Answer Generation (honest about upstream failures), with
+        # SQL->answer cache for paraphrases that converge to the same query.
+        norm_sql = " ".join(sql.lower().split()) if sql else None
+        cached_answer = (
+            self._answer_cache.get(norm_sql)
+            if norm_sql and not execution_output.error and rows
+            else None
         )
+        if cached_answer is not None:
+            log_event("cache.answer.hit", request_id=request_id)
+            answer_output = AnswerGenerationOutput(
+                answer=cached_answer,
+                timing_ms=0.0,
+                llm_stats={
+                    "llm_calls": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "model": self.llm.model,
+                },
+                intermediate_outputs=[{"cache_hit": True}],
+                error=None,
+            )
+        else:
+            answer_output = self.llm.generate_answer(
+                question,
+                sql,
+                rows,
+                execution_error=execution_output.error,
+                no_sql_reason=(
+                    refusal_reason
+                    if generated_sql is None
+                    else (validation_output.error if not validation_output.is_valid else None)
+                ),
+                request_id=request_id,
+            )
         log_event(
             "stage.answer_generation",
             request_id=request_id,
@@ -279,6 +349,21 @@ class AnalyticsPipeline:
             used_llm=answer_output.llm_stats.get("llm_calls", 0) > 0,
             error=answer_output.error,
         )
+
+        # Populate caches only from fully successful requests.
+        if (
+            validation_output.is_valid
+            and not execution_output.error
+            and generated_sql is not None
+        ):
+            self._sql_cache.put(norm_question, generated_sql)
+            if (
+                norm_sql
+                and rows
+                and answer_output.error is None
+                and answer_output.llm_stats.get("llm_calls", 0) > 0
+            ):
+                self._answer_cache.put(norm_sql, answer_output.answer)
 
         # Determine status
         if sql_gen_output.error:

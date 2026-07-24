@@ -31,7 +31,7 @@ def build_schema_context(db_path: str | Path) -> str:
         if not cols:
             raise RuntimeError(f"Table '{TABLE_NAME}' not found in {db_path}")
 
-        lines = []
+        parts = []
         for _cid, name, ctype, *_rest in cols:
             note = ""
             if ctype == "TEXT":
@@ -43,8 +43,8 @@ def build_schema_context(db_path: str | Path) -> str:
                     )
                 ]
                 if len(vals) <= _CATEGORICAL_MAX:
-                    note = " — values: " + ", ".join(repr(v) for v in vals)
-            lines.append(f"  {name} {ctype}{note}")
+                    note = "(" + "|".join(str(v) for v in vals) + ")"
+            parts.append(f"{name} {ctype}{note}")
 
         row_count = conn.execute(f'SELECT COUNT(*) FROM "{TABLE_NAME}"').fetchone()[0]
         age_min, age_max = conn.execute(
@@ -54,11 +54,10 @@ def build_schema_context(db_path: str | Path) -> str:
         conn.close()
 
     schema = (
-        f"Table: {TABLE_NAME} ({row_count:,} rows — one survey respondent per row)\n"
-        "Columns:\n" + "\n".join(lines) + "\n"
-        f"Notes:\n"
-        f"  - age is a raw integer ({age_min}-{age_max}); there is NO age_group column.\n"
-        "  - Score/level columns (addiction_level, anxiety_score, ...) are numeric scales."
+        f"Table: {TABLE_NAME} ({row_count:,} rows; one survey respondent per row)\n"
+        "Columns: " + ", ".join(parts) + "\n"
+        f"Notes: age is a raw integer ({age_min}-{age_max}); there is NO age_group "
+        "column. Score/level columns are numeric scales."
     )
     _cache[key] = schema
     return schema
