@@ -45,6 +45,9 @@ def main() -> None:
     totals: list[float] = []
     success = 0
     count = 0
+    tokens_total = 0
+    llm_calls_total = 0
+    cost_total = 0.0
 
     for _ in range(args.runs):
         for prompt in prompts:
@@ -52,6 +55,9 @@ def main() -> None:
             totals.append(result.timings["total_ms"])
             success += int(result.status == "success")
             count += 1
+            tokens_total += result.total_llm_stats.get("total_tokens", 0)
+            llm_calls_total += result.total_llm_stats.get("llm_calls", 0)
+            cost_total += result.total_llm_stats.get("cost_usd", 0.0)
 
     summary = {
         "runs": args.runs,
@@ -60,6 +66,9 @@ def main() -> None:
         "avg_ms": round(statistics.fmean(totals), 2) if totals else 0.0,
         "p50_ms": round(percentile(totals, 50), 2),
         "p95_ms": round(percentile(totals, 95), 2),
+        "avg_tokens_per_request": round(tokens_total / count, 1) if count else 0.0,
+        "avg_llm_calls_per_request": round(llm_calls_total / count, 2) if count else 0.0,
+        "total_cost_usd": round(cost_total, 6),
     }
     print(json.dumps(summary, indent=2))
 

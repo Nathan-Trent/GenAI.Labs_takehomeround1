@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from src.llm_client import OpenRouterLLMClient, build_default_llm_client
+from src.observability import log_event, new_request_id
 from src.schema import TABLE_NAME, build_schema_context
 from src.types import (
     SQLValidationOutput,
@@ -180,7 +181,7 @@ class AnalyticsPipeline:
         SQLGenerationOutput; per-call details go to intermediate_outputs.
         """
         merged_stats = dict(repair.llm_stats)
-        for key in ("llm_calls", "prompt_tokens", "completion_tokens", "total_tokens"):
+        for key in ("llm_calls", "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd"):
             merged_stats[key] = first.llm_stats.get(key, 0) + repair.llm_stats.get(key, 0)
         repair.llm_stats = merged_stats
         repair.timing_ms += first.timing_ms
@@ -189,10 +190,21 @@ class AnalyticsPipeline:
 
     def run(self, question: str, request_id: str | None = None) -> PipelineOutput:
         start = time.perf_counter()
+        request_id = request_id or new_request_id()
+        log_event("pipeline.request.start", request_id=request_id, question=question[:300])
 
         # Stage 1: SQL Generation (schema-aware)
-        sql_gen_output = self.llm.generate_sql(question, {"schema": self._schema_context})
+        sql_gen_output = self.llm.generate_sql(
+            question, {"schema": self._schema_context}, request_id=request_id
+        )
         generated_sql = sql_gen_output.sql
+        log_event(
+            "stage.sql_generation",
+            request_id=request_id,
+            ms=round(sql_gen_output.timing_ms, 1),
+            got_sql=generated_sql is not None,
+            error=sql_gen_output.error,
+        )
 
         # Stage 2: SQL Validation, with a single repair attempt for compile
         # errors (unknown function/column, syntax). Policy violations (write
@@ -203,6 +215,11 @@ class AnalyticsPipeline:
             and generated_sql is not None
             and (validation_output.error or "").startswith("SQL failed to compile")
         ):
+            log_event(
+                "stage.sql_repair.attempt",
+                request_id=request_id,
+                compile_error=validation_output.error,
+            )
             repair_output = self.llm.generate_sql(
                 question,
                 {
@@ -210,6 +227,7 @@ class AnalyticsPipeline:
                     "previous_sql": generated_sql,
                     "repair_error": validation_output.error,
                 },
+                request_id=request_id,
             )
             sql_gen_output = self._merge_generation_outputs(sql_gen_output, repair_output)
             generated_sql = sql_gen_output.sql
@@ -222,9 +240,24 @@ class AnalyticsPipeline:
             refusal_reason = sql_gen_output.intermediate_outputs[-1].get("refusal_reason")
         sql = validation_output.validated_sql if validation_output.is_valid else None
 
+        log_event(
+            "stage.sql_validation",
+            request_id=request_id,
+            ms=round(validation_output.timing_ms, 1),
+            is_valid=validation_output.is_valid,
+            error=validation_output.error,
+        )
+
         # Stage 3: SQL Execution
         execution_output = self.executor.run(sql)
         rows = execution_output.rows
+        log_event(
+            "stage.sql_execution",
+            request_id=request_id,
+            ms=round(execution_output.timing_ms, 1),
+            row_count=execution_output.row_count,
+            error=execution_output.error,
+        )
 
         # Stage 4: Answer Generation (honest about upstream failures)
         answer_output = self.llm.generate_answer(
@@ -237,6 +270,14 @@ class AnalyticsPipeline:
                 if generated_sql is None
                 else (validation_output.error if not validation_output.is_valid else None)
             ),
+            request_id=request_id,
+        )
+        log_event(
+            "stage.answer_generation",
+            request_id=request_id,
+            ms=round(answer_output.timing_ms, 1),
+            used_llm=answer_output.llm_stats.get("llm_calls", 0) > 0,
+            error=answer_output.error,
         )
 
         # Determine status
@@ -265,7 +306,22 @@ class AnalyticsPipeline:
             "completion_tokens": sql_gen_output.llm_stats.get("completion_tokens", 0) + answer_output.llm_stats.get("completion_tokens", 0),
             "total_tokens": sql_gen_output.llm_stats.get("total_tokens", 0) + answer_output.llm_stats.get("total_tokens", 0),
             "model": sql_gen_output.llm_stats.get("model", "unknown"),
+            "cost_usd": round(
+                sql_gen_output.llm_stats.get("cost_usd", 0.0)
+                + answer_output.llm_stats.get("cost_usd", 0.0),
+                8,
+            ),
         }
+
+        log_event(
+            "pipeline.request.end",
+            request_id=request_id,
+            status=status,
+            total_ms=round(timings["total_ms"], 1),
+            llm_calls=total_llm_stats["llm_calls"],
+            total_tokens=total_llm_stats["total_tokens"],
+            cost_usd=total_llm_stats["cost_usd"],
+        )
 
         return PipelineOutput(
             status=status,

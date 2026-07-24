@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
 from typing import Any
 
+from src.observability import log_event
 from src.types import SQLGenerationOutput, AnswerGenerationOutput
 
 DEFAULT_MODEL = "openai/gpt-5-nano"
+
+# Bounded retry for transient failures (network, rate limit, 5xx).
+# Auth/config errors are not retried — they will never succeed.
+MAX_RETRIES = 2
+RETRY_BACKOFF_S = (0.5, 2.0)
+_NON_RETRYABLE_MARKERS = ("401", "403", "unauthorized", "invalid api key", "api key is required")
 
 # gpt-5-nano is a reasoning model: hidden reasoning tokens count against
 # max_tokens. The baseline's cap of 240 was fully consumed by reasoning,
@@ -46,17 +54,32 @@ class OpenRouterLLMClient:
         temperature: float,
         max_tokens: int,
         json_response: bool = False,
+        purpose: str = "chat",
+        request_id: str | None = None,
     ) -> str:
-        res = self._client.chat.send(
-            messages=messages,
-            model=self.model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            reasoning_effort="minimal",
-            response_format={"type": "json_object"} if json_response else None,
-            timeout_ms=LLM_TIMEOUT_MS,
-            stream=False,
-        )
+        last_exc: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                res = self._send_once(messages, temperature, max_tokens, json_response)
+                break
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc).lower()
+                retryable = not any(m in message for m in _NON_RETRYABLE_MARKERS)
+                log_event(
+                    "llm.call.failed",
+                    level=logging.WARNING,
+                    request_id=request_id,
+                    purpose=purpose,
+                    attempt=attempt + 1,
+                    retryable=retryable,
+                    error=str(exc)[:300],
+                )
+                if not retryable or attempt >= MAX_RETRIES:
+                    raise
+                time.sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
+        else:  # pragma: no cover - loop always breaks or raises
+            raise last_exc
 
         # Token accounting (required for efficiency evaluation).
         usage = getattr(res, "usage", None)
@@ -65,6 +88,20 @@ class OpenRouterLLMClient:
             self._stats["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
             self._stats["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
             self._stats["total_tokens"] += int(getattr(usage, "total_tokens", 0) or 0)
+            cost = getattr(usage, "cost", None)
+            if cost:
+                self._stats["cost_usd"] = self._stats.get("cost_usd", 0.0) + float(cost)
+
+        log_event(
+            "llm.call",
+            request_id=request_id,
+            purpose=purpose,
+            model=self.model,
+            prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+            completion_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+            cost_usd=float(getattr(usage, "cost", 0) or 0) if usage else None,
+            finish_reason=getattr((getattr(res, "choices", None) or [None])[0], "finish_reason", None),
+        )
 
         choices = getattr(res, "choices", None) or []
         if not choices:
@@ -78,6 +115,24 @@ class OpenRouterLLMClient:
                 "by hidden reasoning."
             )
         return content.strip()
+
+    def _send_once(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+        json_response: bool,
+    ):
+        return self._client.chat.send(
+            messages=messages,
+            model=self.model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort="minimal",
+            response_format={"type": "json_object"} if json_response else None,
+            timeout_ms=LLM_TIMEOUT_MS,
+            stream=False,
+        )
 
     @staticmethod
     def _extract_sql(text: str) -> tuple[str | None, str | None]:
@@ -107,7 +162,9 @@ class OpenRouterLLMClient:
             return cleaned[match.start():].strip(), None
         return None, None
 
-    def generate_sql(self, question: str, context: dict) -> SQLGenerationOutput:
+    def generate_sql(
+        self, question: str, context: dict, request_id: str | None = None
+    ) -> SQLGenerationOutput:
         schema = context.get("schema", "") if isinstance(context, dict) else ""
         system_prompt = (
             "You translate natural-language questions into a single SQLite query "
@@ -158,6 +215,8 @@ class OpenRouterLLMClient:
                 temperature=0.0,
                 max_tokens=SQL_GEN_MAX_TOKENS,
                 json_response=True,
+                purpose="sql_generation" if not repair_error else "sql_repair",
+                request_id=request_id,
             )
             sql, refusal_reason = self._extract_sql(raw_text)
         except Exception as exc:
@@ -187,6 +246,7 @@ class OpenRouterLLMClient:
         rows: list[dict[str, Any]],
         execution_error: str | None = None,
         no_sql_reason: str | None = None,
+        request_id: str | None = None,
     ) -> AnswerGenerationOutput:
         """Produce the user-facing answer.
 
@@ -260,6 +320,8 @@ class OpenRouterLLMClient:
                 ],
                 temperature=0.2,
                 max_tokens=ANSWER_MAX_TOKENS,
+                purpose="answer_generation",
+                request_id=request_id,
             )
         except Exception as exc:
             error = str(exc)
